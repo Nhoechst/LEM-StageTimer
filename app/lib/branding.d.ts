@@ -1,0 +1,24 @@
+import type { Show } from '../data';
+export type Branding = Pick<Show, 'timerFont' | 'textFont' | 'templateId' | 'logoOn' | 'uploadedLogo' | 'logoName' | 'uploadedLogoLight' | 'uploadedLogoDark' | 'logoNameLight' | 'logoNameDark'>;
+export type SavedTemplate = Branding & { id: string; name: string };
+export type SiteSettings = {
+  pin: string; mainHeader?: string; subHeader?: string; headerLogo?: string; headerLogoName?: string;
+  headerLogoLight?: string; headerLogoDark?: string; headerLogoNameLight?: string; headerLogoNameDark?: string;
+};
+export const LOGO_FIELDS: ('uploadedLogo' | 'uploadedLogoLight' | 'uploadedLogoDark')[];
+export const LOGO_NAME_FIELDS: ('logoName' | 'logoNameLight' | 'logoNameDark')[];
+export const HEADER_LOGO_FIELDS: ('headerLogo' | 'headerLogoLight' | 'headerLogoDark')[];
+export const HEADER_LOGO_NAME_FIELDS: ('headerLogoName' | 'headerLogoNameLight' | 'headerLogoNameDark')[];
+export const SETTING_FIELDS: (keyof Omit<SiteSettings, 'pin'>)[];
+export function selectLogo(mode: 'light' | 'dark', light?: string, dark?: string): string;
+export function normalizeLogo<T>(value: T, logo?: string, name?: string, previous?: T): T;
+export function normalizeBrandingState<T extends { shows: Show[]; settings: SiteSettings; templates?: SavedTemplate[] }>(state: T): T;
+export function isInheritedLogo(value: unknown, legacy: unknown): boolean;
+export function displayLogo(show: Branding): string;
+export const DEFAULT_SETTINGS: Required<Omit<SiteSettings, 'pin'>>;
+export const DESIGN_IDS: string[];
+export const MAX_LOGO_BYTES: number;
+export function sameTemplateName(a: string, b: string): boolean;
+export function isLogo(value: unknown): value is string;
+export function brandingSnapshot(show: Branding): Branding;
+export function readLogo(file: File): Promise<string>;
