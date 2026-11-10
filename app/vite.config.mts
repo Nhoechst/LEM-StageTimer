@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 
 export default defineConfig(({ mode }) => ({
   base: './',
+  build: mode === 'pelican' ? { outDir: '../www', emptyOutDir: true } : {},
   define: {
     'import.meta.env.VITE_STATE_API': JSON.stringify(mode === 'pelican' ? './api.php' : '/api/state'),
   },
@@ -10,6 +11,7 @@ export default defineConfig(({ mode }) => ({
     name: 'php-backend',
     generateBundle() {
       this.emitFile({ type: 'asset', fileName: 'api.php', source: readFileSync(new URL('./php/api.php', import.meta.url), 'utf8') });
+      this.emitFile({ type: 'asset', fileName: 'SharedAccounts.php', source: readFileSync(new URL('./php/SharedAccounts.php', import.meta.url), 'utf8') });
     },
   }] : [],
   server: {

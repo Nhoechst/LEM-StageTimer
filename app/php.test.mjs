@@ -298,7 +298,7 @@ test('PHP cue modes retain private JSON migration, count-up origins, pause/resum
   });
 
 test('PHP without pdo_sqlite returns a controlled error', {
-  skip: spawnSync('php', ['-n', '-v']).status !== 0,
+  skip: spawnSync('php', ['-n', '-r', 'exit(extension_loaded("pdo_sqlite") ? 1 : 0);']).status !== 0,
 }, () => {
   const result = spawnSync('php', ['-n', '-r',
     '$_SERVER["REQUEST_METHOD"]="GET"; require $argv[1];', api,

@@ -29,7 +29,18 @@ class HttpError extends Error {
   }
 }
 
-export function createStore(dbPath = process.env.DB_PATH || path.join(ROOT, 'lem-time.db')) {
+function defaultDatabasePath() {
+  const directory = process.env.LEM_DATA_DIR;
+  if (directory && !path.isAbsolute(directory)) throw new Error('LEM_DATA_DIR must be absolute.');
+  return directory ? path.join(directory, 'lem-time.db') : process.env.DB_PATH || path.join(ROOT, 'lem-time.db');
+}
+
+function requireSupportedAuth() {
+  if (process.env.LEM_AUTH_DB) throw new Error('LEM_AUTH_DB requires the PHP backend. Node shared-account authentication is unsupported.');
+}
+
+export function createStore(dbPath = defaultDatabasePath()) {
+  requireSupportedAuth();
   const filename = path.resolve(dbPath);
   mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
   for (const file of [filename, `${filename}.bak`, `${filename}.bak-next`]) {
@@ -346,12 +357,13 @@ function staticFile(req, res, distDir, dbFilename) {
 }
 
 export function createServer({
-  dbPath = process.env.DB_PATH || path.join(ROOT, 'lem-time.db'),
+  dbPath = defaultDatabasePath(),
   distDir = path.join(ROOT, 'dist'),
   host = process.env.HOST || '127.0.0.1',
   appOrigin = process.env.APP_ORIGIN,
   store,
 } = {}) {
+  requireSupportedAuth();
   const publicOrigin = parseAppOrigin(appOrigin);
   store ??= createStore(dbPath);
   const server = http.createServer(async (req, res) => {

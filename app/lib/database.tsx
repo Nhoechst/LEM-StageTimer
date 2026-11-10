@@ -7,10 +7,12 @@ import { isStatePayload } from './schema.js';
 import { readShowLink } from './show-links.js';
 import { mergeState, serialize, timerCommands } from './sync.js';
 import type { SiteSettings, SavedTemplate } from './branding';
-import { establishOperatorCookie } from './operator-cookie';
+import { cookieLock, establishOperatorCookie } from './operator-cookie';
 import { normalizeBrandingState } from './branding.js';
 
 type Data = { shows: Show[]; settings: SiteSettings; templates?: SavedTemplate[] };
+type Account = { enabled: boolean; user: { username: string; role: string } | null; csrf?: string; error?: string };
+type RemoteState = Data & { initialized: boolean; revision: number; timerVersions?: Record<string, unknown>; auth: { configured: boolean; authorized: boolean }; account?: Account };
 type DatabaseContextValue = {
   shows: Show[];
   setShows: Dispatch<SetStateAction<Show[]>>;
@@ -49,31 +51,38 @@ class DatabaseError extends Error {
 const operatorId = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => ('0' + byte.toString(16)).slice(-2)).join('');
 const operatorHeaders = { 'X-Operator-ID': operatorId };
 const stateApi = import.meta.env.VITE_STATE_API;
+let sharedAccountsEnabled: boolean | undefined;
+const sessionRequest = (job: () => Promise<Response>) =>
+  sharedAccountsEnabled === true ? cookieLock(job) : job();
 
-async function requestState(payload?: Data & { revision: number; timerCommands?: string[] }) {
+async function requestState(payload?: Data & { revision: number; timerCommands?: string[] }): Promise<RemoteState> {
+  const discoveringAccounts = sharedAccountsEnabled === undefined;
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 10000);
   try {
-    const response = await fetch(stateApi, {
+    const response = await sessionRequest(() => fetch(stateApi, {
       method: payload ? 'PUT' : 'GET',
       headers: { ...operatorHeaders, ...(payload ? { 'Content-Type': 'application/json' } : {}) },
-      credentials: 'same-origin',
+      // Discovery must not accept a cookie that could race another tab's login.
+      credentials: discoveringAccounts ? 'omit' : 'same-origin',
       body: payload ? JSON.stringify(payload) : undefined,
       signal: controller.signal,
       cache: 'no-store',
-    });
+    }));
     if (response.status === 409) {
       throw new DatabaseError('The database changed in another window. Reload to use the latest saved data.', true);
     }
     if (response.status === 401) throw new DatabaseError('Enter the PIN to authorize this window.', false, true);
     if (!response.ok) throw new DatabaseError(`Database request failed (${response.status}). Check that the backend is running and its data folder is writable.`);
     const result = await response.json();
+    sharedAccountsEnabled = result.account?.enabled === true;
+    if (discoveringAccounts && sharedAccountsEnabled) return requestState(payload);
     if (!Number.isSafeInteger(result.revision) || result.revision < 0 ||
         typeof result.initialized !== 'boolean' ||
         (result.initialized && !isStatePayload(result))) {
       throw new DatabaseError('The database returned invalid data. Your browser data has not been cleared.');
     }
-    return (result.initialized ? normalizeBrandingState(result) : result) as Data & { initialized: boolean; revision: number; timerVersions?: Record<string, unknown>; auth: { configured: boolean; authorized: boolean } };
+    return (result.initialized ? normalizeBrandingState(result) : result) as RemoteState;
   } catch (error) {
     if (error instanceof DatabaseError) throw error;
     throw new DatabaseError('Cannot connect to the database. Check the backend and its writable data folder, then retry.');
@@ -86,6 +95,29 @@ function migrationData(): Data {
   return normalizeBrandingState({ shows: readShows(INITIAL_SHOWS), settings: { pin: '' } });
 }
 
+function AccountLogin({ account, submit }: { account: Account; submit: (username: string, password: string) => Promise<void> }) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [working, setWorking] = useState(false);
+  return <main className="mx-auto max-w-lg p-8">
+    <h1 className="text-xl font-bold">Sign in to LEM-Time</h1>
+    <p className="my-4">Use your Dashboard account. If your session expired, sign in again. The operator PIN is still required when configured.</p>
+    <form onSubmit={async event => {
+      event.preventDefault(); setWorking(true); setError('');
+      try { await submit(username, password); }
+      catch (failure) { setError((failure as Error).message); }
+      finally { setPassword(''); setWorking(false); }
+    }}>
+      <label className="my-3 block">Username<input required autoComplete="username" value={username} onChange={event => setUsername(event.target.value)} className="block w-full rounded border p-2"/></label>
+      <label className="my-3 block">Password<input required type="password" autoComplete="current-password" value={password} onChange={event => setPassword(event.target.value)} className="block w-full rounded border p-2"/></label>
+      {(account.error || error) && <p role="alert" className="my-3">{account.error || error}</p>}
+      <button disabled={working || Boolean(account.error)} className="rounded border px-4 py-2">{working ? 'Signing in…' : 'Sign in'}</button>
+    </form>
+    <p className="mt-4 text-sm">Manage accounts and change temporary passwords in Dashboard. Display links remain public.</p>
+  </main>;
+}
+
 export function DatabaseProvider({ children }: { children: ReactNode }) {
   const [data, setData] = useState<Data>({ shows: [], settings: { pin: '' } });
   const [loaded, setLoaded] = useState(false);
@@ -96,6 +128,8 @@ export function DatabaseProvider({ children }: { children: ReactNode }) {
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [auth, setAuth] = useState({ configured: false, authorized: false });
+  const [account, setAccount] = useState<Account>({ enabled: false, user: null });
+  const [accountError, setAccountError] = useState('');
   const [authWorking, setAuthWorking] = useState(false);
   const authBusy = useRef(false);
   const authRef = useRef(auth);
@@ -110,6 +144,16 @@ export function DatabaseProvider({ children }: { children: ReactNode }) {
     return view === 'display' || view === 'dsm' || view === 'dsm-preview' || view === 'chroma';
   });
   const readOnlyRef = useRef(readOnly);
+  useEffect(() => {
+    const navigate = () => {
+      const view = readShowLink(window.location.hash)?.view;
+      const value = Boolean(view && view !== 'control');
+      readOnlyRef.current = value;
+      setReadOnlyState(value);
+    };
+    window.addEventListener('hashchange', navigate);
+    return () => window.removeEventListener('hashchange', navigate);
+  }, []);
   const versions = useRef<Record<string, unknown>>({});
   // Track intent separately: replacing a running timer with the same value is a command too.
   const commands = useRef(new Map<string, number>());
@@ -125,6 +169,7 @@ export function DatabaseProvider({ children }: { children: ReactNode }) {
     const next = remote.initialized ? { shows: remote.shows, settings: remote.settings, templates: remote.templates || [] } :
       { shows: [], settings: { pin: '' } };
     acceptAuth(remote.auth);
+    if (remote.account) setAccount(remote.account);
     if (!remote.auth.authorized) commands.current.clear();
     const merged = remote.auth.authorized ? mergeState(base, local, next, versions.current, remote.timerVersions || {}, Array.from(commands.current.keys())) : next;
     revision.current = remote.revision;
@@ -144,7 +189,7 @@ export function DatabaseProvider({ children }: { children: ReactNode }) {
       try {
         let remote = await requestState();
         if (cancelled) return;
-        if (!remote.initialized && !readOnlyRef.current) {
+        if (!remote.initialized && !readOnlyRef.current && remote.auth.authorized) {
           try {
             remote = await requestState({ ...migrationData(), revision: remote.revision });
           } catch (failure) {
@@ -159,6 +204,7 @@ export function DatabaseProvider({ children }: { children: ReactNode }) {
         initialized.current = remote.initialized;
         versions.current = remote.timerVersions || {};
         acceptAuth(remote.auth);
+        if (remote.account) setAccount(remote.account);
         saved.current = serialize(next);
         setData(next);
         setLoaded(true);
@@ -288,6 +334,7 @@ export function DatabaseProvider({ children }: { children: ReactNode }) {
     }
   };
   const download = () => {
+    if (account.enabled && !account.user) return;
     const url = URL.createObjectURL(new Blob([JSON.stringify(latest.current, null, 2)], { type: 'application/json' }));
     const link = document.createElement('a');
     link.href = url;
@@ -305,11 +352,11 @@ export function DatabaseProvider({ children }: { children: ReactNode }) {
       // Do not let an older poll overwrite a newly granted/revoked authorization.
       while (inFlight.current) await new Promise(resolve => window.setTimeout(resolve, 20));
       await establishOperatorCookie(stateApi, operatorHeaders);
-      const response = await fetch(stateApi, {
+      const response = await sessionRequest(() => fetch(stateApi, {
         method: 'POST', headers: { ...operatorHeaders, 'Content-Type': 'application/json' },
         credentials: 'same-origin', body: JSON.stringify({ action, pin }), cache: 'no-store',
         signal: controller.signal,
-      });
+      }));
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'Unable to update operator authorization.');
       acceptAuth(result.auth);
@@ -327,12 +374,38 @@ export function DatabaseProvider({ children }: { children: ReactNode }) {
       setSaveAttempt(attempt => attempt + 1);
     }
   };
+  const accountAction = async (action: 'login' | 'logout', username = '', password = '') => {
+    if (authBusy.current) throw new Error('An authorization request is already in progress.');
+    authBusy.current = true;
+    setAuthWorking(true);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 20000);
+    try {
+      while (inFlight.current) await new Promise(resolve => window.setTimeout(resolve, 20));
+      const response = await sessionRequest(() => fetch(stateApi, {
+        method: 'POST', credentials: 'same-origin', cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+        body: JSON.stringify({ action, username, password, csrf: account.csrf }),
+      }));
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Unable to update account session.');
+      window.location.reload();
+    } finally {
+      window.clearTimeout(timeout);
+      authBusy.current = false;
+      setAuthWorking(false);
+      setSaveAttempt(attempt => attempt + 1);
+    }
+  };
   if (!loaded) {
     return <main className="mx-auto max-w-lg p-8">
       <h1>LEM-Time database</h1>
       {error ? <><p role="alert" className="my-4">{error}</p><button onClick={retry}>Retry connection</button></> :
         <p role="status">Loading saved shows…</p>}
     </main>;
+  }
+  if (account.enabled && !account.user && !readOnly) {
+    return <AccountLogin account={account} submit={(username, password) => accountAction('login', username, password)}/>;
   }
   return <DatabaseContext.Provider value={{
     shows: data.shows,
@@ -369,10 +442,15 @@ export function DatabaseProvider({ children }: { children: ReactNode }) {
       <p>{error} {readOnly ? 'Display refresh is unavailable.' : 'Changes in this window are not saved.'}</p>
       <div className="mt-2 flex gap-4">
         {!conflict && <button onClick={retry}>{readOnly ? 'Retry refresh' : 'Retry save'}</button>}
-        <button onClick={download}>Download unsaved data</button>
+        {(!account.enabled || account.user) && <button onClick={download}>Download unsaved data</button>}
         {conflict && <button onClick={() => window.location.reload()}>Reload saved data</button>}
       </div>
     </aside> : null}
+    {account.enabled && account.user && !readOnly && <aside className="flex items-center justify-end gap-3 p-2 text-sm">
+      <span>Signed in as {account.user.username}</span>
+      <button onClick={() => { void accountAction('logout').catch(failure => setAccountError(failure.message)); }}>Sign out</button>
+      {accountError && <span role="alert">{accountError}</span>}
+    </aside>}
     {children}
   </DatabaseContext.Provider>;
 }

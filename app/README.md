@@ -2,14 +2,93 @@
 
 ## PHP-FPM / Pelican deployment
 
-The repository's root README documents the upload-ready `lem-time-pelican.zip`.
-Use that package for React + PHP-FPM without Node/npm on the hosting server.
-Developers can rebuild it with `npm ci` and `npm run build:pelican`; deploy only
-the resulting `dist/` contents. The PHP backend requires PHP 8.2+ with PDO SQLite
+The repository's `www/` directory is upload-ready for React + PHP-FPM without
+Node/npm on the hosting server. Developers rebuild it from `app/` with
+`npm ci` and `npm run build:pelican`; deploy the resulting `www/` contents.
+The build packages `api.php` and the unchanged Dashboard
+`shared-auth/SharedAccounts.php` helper alongside the generated assets.
+The PHP backend requires PHP 8.2+ with PDO SQLite
 enabled in PHP-FPM and stores data outside the public web root. It can import
 existing JSON saves once into an uninitialized database; see the root README
 before switching an existing installation. The Node instructions below remain
 available for local development and the original Node deployment.
+
+### Portainer persistence and optional Dashboard accounts
+
+Merge these settings into your existing PHP-FPM service in Portainer (use your
+own absolute host paths; both directories must be outside the served `www/`):
+
+```yaml
+services:
+  timer:
+    environment:
+      LEM_DATA_DIR: /var/lib/lem-data
+      LEM_AUTH_DB: /var/lib/lem-auth/users.db
+    volumes:
+      - /srv/lem/stagetimer-data:/var/lib/lem-data
+      - /srv/lem/shared-auth:/var/lib/lem-auth
+```
+
+Mount `/srv/lem/shared-auth` into Dashboard at its configured shared-account
+directory too. **Do not mount Dashboard's application database as timer storage.**
+The timer data mount is site-specific: it holds `lem-time.db`, its `.bak`, and
+private account `sessions/`. Recreating/updating a container must retain both
+host directories. `LEM_DATA_DIR` must be absolute and takes precedence over
+`DB_PATH`; unset it to retain the previous storage defaults. Never start an
+existing installation against an empty new mount: stop timer writes, back up
+the old private directory, copy its database/backups (and legacy JSON if still
+needed) to the timer mount, then verify permissions before restarting.
+
+The shared mount must be writable by the PHP-FPM identity in both applications:
+login updates last-login/throttle records and SQLite needs directory access for
+journals. Use compatible numeric UID/GID and restricted permissions; do not use
+world-writable directories. PHP-FPM must receive the environment variables
+(configure its pool environment/`clear_env` setting where necessary).
+
+Safe rollout: back up each application database and the shared store; stop the
+apps before migration; run **Dashboard's explicit shared-users migration**
+inside the Dashboard container:
+
+```sh
+php /www/bin/shared-users.php /var/lib/lem-data/dashboard.db /var/lib/lem-auth/users.db
+```
+
+The migration rejects an existing destination; if your shared store is already
+initialized, reuse it rather than rerunning migration or overwriting it.
+Deploy/restart Dashboard first and confirm account login,
+then restart StageTimer with these mounts/environment and refresh old tabs.
+Only Dashboard initializes the shared schema or manages users, passwords and
+roles. StageTimer never creates a missing shared database or silently falls
+back to public writes. Upgrade the apps/helper together for schema changes.
+Do not disable `LEM_AUTH_DB` to troubleshoot an outage: doing so intentionally
+restores the original no-account behavior.
+
+When `LEM_AUTH_DB` is set, all control pages, imports, backups/recovery downloads,
+state writes, and operator bootstrap/unlock/PIN configuration require a shared
+login, **even when no PIN is configured**. All shared roles may operate timers.
+The existing installation PIN remains an additional requirement when configured;
+signing in does not unlock it. Public state GETs and display/DSM/chroma links
+remain public, including during shared-login outages; accounts do not make
+show contents private. Server-generated previous-state backups occur only on
+authorized writes/imports.
+
+Use the **same username/password as Dashboard**, but sign in separately.
+StageTimer uses its own `lem_stagetimer_account` HttpOnly/SameSite=Strict cookie,
+Secure under HTTPS, with a 12-hour account timeout. PIN authorization remains
+per window. Expiry returns control pages to sign-in; deletion, password changes
+and forced-password-change flags invalidate account sessions. Temporary-password
+users must change their password in Dashboard before signing in here. No
+password/token is saved in URLs or localStorage. Login/logout require same-origin
+JSON and a session CSRF token. Use HTTPS at the reverse proxy and pass the
+correct host/HTTPS information to PHP-FPM.
+
+**Shared login is supported by PHP only.** The Node backend refuses startup/store
+creation whenever `LEM_AUTH_DB` is enabled rather than accepting unprotected
+writes. Node supports absolute `LEM_DATA_DIR` persistence in its original
+PIN-only mode. Leave `LEM_AUTH_DB` unset to retain the existing default behavior
+on either backend. Serve the helper only as PHP/deny direct requests: the supplied
+root `default.conf` permits only `api.php` and `ping.php` entry points and blocks
+all other paths. Never publish source, databases, backups or session files.
 
 ## Run locally
 
@@ -95,7 +174,7 @@ The 10 MiB request limit includes every logo copy in all shows/templates.
 Site settings/templates are installation-wide, not per-user preferences.
 When a PIN is configured, both backends require an authorized operator session for
 all state writes (including settings/templates). Reads and display links stay public.
-There are no accounts or private-show read permissions. Before first PIN setup,
+With shared login disabled there are no accounts or private-show read permissions. Before first PIN setup,
 writes/setup are public: configure the PIN on a trusted network first, and retain
 HTTPS/reverse-proxy protection around both frontend and API.
 
@@ -117,7 +196,9 @@ HTTPS. One browser cookie is combined with the non-secret `X-Operator-ID` to
 authorize each document independently, including tabs in the same browser.
 Reloads do not accumulate per-document cookies. No credential goes into URLs/localStorage.
 Cookie establishment is coordinated across tabs (Web Locks, with a non-secret
-IndexedDB mutex fallback on HTTP). Public GETs never set credentials, so a delayed
+IndexedDB mutex fallback on HTTP). Shared-account API requests use the same
+coordination to prevent a delayed poll from replacing a newly rotated login
+cookie. In the default PIN-only mode public GETs never set credentials, so a delayed
 reader cannot overwrite another operator's newly authorized session.
 Sessions expire after 12 hours; a new/reloaded document must authorize again.
 Five failed PIN attempts per source address per minute are allowed, persisted in SQLite.

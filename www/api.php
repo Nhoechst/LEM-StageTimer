@@ -373,10 +373,12 @@ function hashPin(string $pin): string
 
 function operatorStatus(PDO $db, string $id, string $token): array
 {
+    global $sharedEnabled, $sharedUser;
     $configured = $db->query('SELECT pin FROM settings WHERE id = 1')->fetchColumn() !== '';
     $query = $db->prepare('SELECT 1 FROM operator_sessions WHERE id = ? AND token = ? AND expires > ?');
     $query->execute([$id, hash('sha256', $token), (int) (microtime(true) * 1000)]);
-    return ['configured' => $configured, 'authorized' => !$configured || (bool) $query->fetchColumn()];
+    return ['configured' => $configured, 'authorized' => (!$sharedEnabled || $sharedUser !== null) &&
+        (!$configured || (bool) $query->fetchColumn())];
 }
 
 function operatorFail(PDO $db, int $status, string $message): never
@@ -449,6 +451,9 @@ function operatorCookie(string $token): void
 
 $db = null;
 $transaction = false;
+$sharedEnabled = getenv('LEM_AUTH_DB') !== false && getenv('LEM_AUTH_DB') !== '';
+$sharedUser = null;
+$account = ['enabled' => $sharedEnabled, 'user' => null];
 try {
     $method = $_SERVER['REQUEST_METHOD'];
     if (!in_array($method, ['GET', 'PUT', 'POST'], true)) {
@@ -498,11 +503,17 @@ try {
         }
     }
 
-    // Default stays outside the egg's www, including subdirectory installs.
     if (!extension_loaded('pdo_sqlite')) {
         throw new RuntimeException('Enable pdo_sqlite in the active PHP-FPM configuration and restart PHP-FPM.');
     }
-    $filename = getenv('DB_PATH') ?: '/home/container/lem-time-data/lem-time.db';
+    // Keep state, backups and account sessions on the private persistent mount.
+    $dataDirectory = getenv('LEM_DATA_DIR');
+    if ($dataDirectory === false) $dataDirectory = '';
+    if ($dataDirectory !== '' && !str_starts_with($dataDirectory, '/')) {
+        throw new RuntimeException('LEM_DATA_DIR must be an absolute private directory.');
+    }
+    $filename = $dataDirectory !== '' ? rtrim($dataDirectory, '/') . '/lem-time.db' :
+        (getenv('DB_PATH') ?: '/home/container/lem-time-data/lem-time.db');
     if (!str_starts_with($filename, '/') || !str_ends_with($filename, '.db')) {
         throw new RuntimeException('DB_PATH must be an absolute .db path.');
     }
@@ -518,6 +529,71 @@ try {
         is_link($filename)) {
         throw new RuntimeException('Database must be outside the web root.');
     }
+    if ($sharedEnabled) {
+        require_once __DIR__ . '/SharedAccounts.php';
+        $sessionDirectory = $directory . '/sessions';
+        if (is_link($sessionDirectory) ||
+            (!is_dir($sessionDirectory) && !mkdir($sessionDirectory, 0700) && !is_dir($sessionDirectory))) {
+            throw new RuntimeException('Unable to create private account session directory.');
+        }
+        session_save_path($sessionDirectory);
+        ini_set('session.use_strict_mode', '1');
+        ini_set('session.use_only_cookies', '1');
+        ini_set('session.use_trans_sid', '0');
+        ini_set('session.gc_maxlifetime', '43200');
+        session_name('lem_stagetimer_account');
+        session_set_cookie_params([
+            'lifetime' => 43200, 'path' => '/', 'httponly' => true, 'samesite' => 'Strict',
+            'secure' => (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ||
+                str_starts_with($origin ?? '', 'https://')
+        ]);
+        if (!session_start()) throw new RuntimeException('Unable to start StageTimer account session.');
+        $_SESSION['csrf'] ??= bin2hex(random_bytes(32));
+        $account['csrf'] = $_SESSION['csrf'];
+        $accounts = null;
+        try {
+            $accounts = \Lem\SharedAccounts::open(getenv('LEM_AUTH_DB'));
+            $sharedUser = $accounts->user();
+        } catch (RuntimeException | PDOException $error) {
+            $accounts = null;
+            error_log('LEM-Time shared accounts: ' . $error->getMessage());
+            $account['error'] = 'Shared login unavailable. Ask the Dashboard administrator to check the shared database.';
+        }
+        $account['user'] = $sharedUser;
+        if ($method === 'POST' && in_array($payload->action ?? '', ['login', 'logout'], true)) {
+            if (!is_string($payload->csrf ?? null) || !hash_equals($_SESSION['csrf'], $payload->csrf)) {
+                respond(403, ['error' => 'Login session expired. Refresh and try again.']);
+            }
+            if ($accounts === null) respond(503, ['error' => $account['error']]);
+            if ($payload->action === 'login') {
+                if (!is_string($payload->username ?? null) || !is_string($payload->password ?? null) ||
+                    strlen($payload->username) > 200 || strlen($payload->password) > 4096) {
+                    respond(400, ['error' => 'Enter a username and password.']);
+                }
+                try {
+                    $success = $accounts->login($payload->username, $payload->password, $_SERVER['REMOTE_ADDR'] ?? '');
+                } catch (PDOException $error) {
+                    throw $error;
+                } catch (RuntimeException $error) {
+                    respond(403, ['error' => $error->getMessage()]);
+                }
+                if (!$success) respond(401, ['error' => 'Incorrect username or password.']);
+            } else {
+                $accounts->logout();
+            }
+            // A new account login must authorize the existing installation PIN again.
+            setcookie('lem_operator', '', ['expires' => time() - 3600, 'path' => '/',
+                'httponly' => true, 'samesite' => 'Strict',
+                'secure' => session_get_cookie_params()['secure']]);
+            $_SESSION['csrf'] = bin2hex(random_bytes(32));
+            respond(200, ['account' => ['enabled' => true, 'user' => $accounts->user(), 'csrf' => $_SESSION['csrf']]]);
+        }
+        session_write_close();
+        if ($method !== 'GET' && $sharedUser === null) {
+            respond($accounts === null ? 503 : 401, ['error' => $account['error'] ?? 'Sign in to LEM-Time. Your account session may have expired.']);
+        }
+    }
+
     $legacy = getenv('STATE_PATH') ?: $directory . '/lem-time.json';
     if (!file_exists($filename) && file_exists($filename . '.bak')) {
         throw new RuntimeException('Database backup found without database. Restore it before continuing.');
@@ -574,7 +650,7 @@ try {
             if (is_link($legacy) || (!file_exists($legacy) && file_exists($legacy . '.bak'))) {
                 throw new RuntimeException('Restore JSON state from a private regular file before importing.');
             }
-            if (file_exists($legacy)) {
+            if (file_exists($legacy) && (!$sharedEnabled || $sharedUser !== null)) {
                 $legacyRoot = realpath(dirname($legacy));
                 if (!str_starts_with($legacy, '/') || !is_file($legacy) || $legacyRoot === false ||
                     $legacyRoot === $publicRoot || str_starts_with($legacyRoot, $publicRoot . '/')) {
@@ -628,7 +704,7 @@ try {
         $auth = operatorRequest($db, $payload, $id, $token);
         $db->exec('COMMIT');
         $transaction = false;
-        respond(200, ['auth' => $auth]);
+        respond(200, $sharedEnabled ? ['auth' => $auth, 'account' => $account] : ['auth' => $auth]);
     }
     if ($method === 'PUT') {
         if (!operatorStatus($db, $id, $token)['authorized']) {
@@ -646,6 +722,7 @@ try {
     }
     $result = readState($db);
     $result['auth'] = operatorStatus($db, $id, $token);
+    if ($sharedEnabled) $result['account'] = $account;
     $db->exec('COMMIT');
     $transaction = false;
     respond(200, $result);

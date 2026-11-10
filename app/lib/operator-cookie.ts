@@ -1,6 +1,6 @@
-// Coordinate only cookie establishment, never timer/state requests. The fallback
-// stores a short-lived, non-secret mutex, not a PIN or session credential.
-async function cookieLock<T>(job: () => Promise<T>): Promise<T> {
+// Shared-account requests also coordinate so an in-flight poll cannot replace
+// a freshly rotated login cookie. The fallback stores only a non-secret mutex.
+export async function cookieLock<T>(job: () => Promise<T>): Promise<T> {
   if (navigator.locks) {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 25000);
