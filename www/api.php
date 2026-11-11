@@ -531,6 +531,7 @@ try {
     }
     if ($sharedEnabled) {
         require_once __DIR__ . '/SharedAccounts.php';
+        require_once __DIR__ . '/SharedLogin.php';
         $sessionDirectory = $directory . '/sessions';
         if (is_link($sessionDirectory) ||
             (!is_dir($sessionDirectory) && !mkdir($sessionDirectory, 0700) && !is_dir($sessionDirectory))) {
@@ -551,8 +552,17 @@ try {
         $_SESSION['csrf'] ??= bin2hex(random_bytes(32));
         $account['csrf'] = $_SESSION['csrf'];
         $accounts = null;
+        $sharedLogin = null;
+        $clearOperator = static fn () => setcookie('lem_operator', '', ['expires' => time() - 3600, 'path' => '/',
+            'httponly' => true, 'samesite' => 'Strict',
+            'secure' => session_get_cookie_params()['secure']]);
         try {
             $accounts = \Lem\SharedAccounts::open(getenv('LEM_AUTH_DB'));
+            // Single sign-on: follow log-ins and log-outs made in Dashboard or Lower Thirds on this address.
+            $sharedLogin = new \Lem\SharedLogin($accounts->pdo);
+            if ($sharedLogin->syncSession()) {
+                $clearOperator(); // a new account login must authorize the installation PIN again
+            }
             $sharedUser = $accounts->user();
         } catch (RuntimeException | PDOException $error) {
             $accounts = null;
@@ -578,13 +588,13 @@ try {
                     respond(403, ['error' => $error->getMessage()]);
                 }
                 if (!$success) respond(401, ['error' => 'Incorrect username or password.']);
+                $sharedLogin?->afterLogin(); // also log in to Dashboard and Lower Thirds
             } else {
                 $accounts->logout();
+                $sharedLogin?->afterLogout(); // also log out of Dashboard and Lower Thirds
             }
             // A new account login must authorize the existing installation PIN again.
-            setcookie('lem_operator', '', ['expires' => time() - 3600, 'path' => '/',
-                'httponly' => true, 'samesite' => 'Strict',
-                'secure' => session_get_cookie_params()['secure']]);
+            $clearOperator();
             $_SESSION['csrf'] = bin2hex(random_bytes(32));
             respond(200, ['account' => ['enabled' => true, 'user' => $accounts->user(), 'csrf' => $_SESSION['csrf']]]);
         }

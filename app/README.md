@@ -6,7 +6,7 @@ The repository's `www/` directory is upload-ready for React + PHP-FPM without
 Node/npm on the hosting server. Developers rebuild it from `app/` with
 `npm ci` and `npm run build:pelican`; deploy the resulting `www/` contents.
 The build packages `api.php` and the unchanged Dashboard
-`shared-auth/SharedAccounts.php` helper alongside the generated assets.
+`shared-auth/SharedAccounts.php` and `shared-auth/SharedLogin.php` helpers alongside the generated assets.
 The PHP backend requires PHP 8.2+ with PDO SQLite
 enabled in PHP-FPM and stores data outside the public web root. It can import
 existing JSON saves once into an uninitialized database; see the root README
@@ -72,7 +72,10 @@ remain public, including during shared-login outages; accounts do not make
 show contents private. Server-generated previous-state backups occur only on
 authorized writes/imports.
 
-Use the **same username/password as Dashboard**, but sign in separately.
+Use the **same username/password as Dashboard**. Logging in to Dashboard or
+Lower Thirds on the same address also logs you in here, and logging out of any of
+them logs you out of all (see *One log-in for all LEM apps* below); signing in here
+clears this window's PIN authorization, as before.
 StageTimer uses its own `lem_stagetimer_account` HttpOnly/SameSite=Strict cookie,
 Secure under HTTPS, with a 12-hour account timeout. PIN authorization remains
 per window. Expiry returns control pages to sign-in; deletion, password changes
@@ -81,6 +84,25 @@ users must change their password in Dashboard before signing in here. No
 password/token is saved in URLs or localStorage. Login/logout require same-origin
 JSON and a session CSRF token. Use HTTPS at the reverse proxy and pass the
 correct host/HTTPS information to PHP-FPM.
+
+#### One log-in for all LEM apps (same address, any port)
+
+Dashboard, Lower Thirds and StageTimer running on the same IP address (for example
+`:8000`, `:8003` and the timer's port) share one log-in. Log in to any of them and
+you are logged in to the others; log out of one and you are logged out of all of them.
+It uses a signed `lem_sso` cookie: browsers send cookies for an address to every port on it,
+and the cookie only holds the user name, a log-in id, the expiry and an HMAC. The key and the
+list of ended log-ins live in the shared account database (`LEM_AUTH_DB`), so it needs no extra
+settings. It stays alive for 12 hours after last use. A password change, a deleted account,
+a "must change password" flag or a log-out anywhere ends it straight away. Users with a
+temporary password are not logged in to the other apps until they have changed it in Dashboard.
+Roles still apply per app, and StageTimer still asks for its installation PIN.
+
+Update all three apps together: `SharedLogin.php` must be the same file in each
+(Dashboard `shared-auth/`, Lower Thirds `src/`, StageTimer `app/php/` and `www/`).
+An app that has not been updated keeps working, but users have to log in to it separately.
+Different host names (for example `10.0.0.5` and `lem.local`) do not share cookies, so open all
+three by the same address.
 
 **Shared login is supported by PHP only.** The Node backend refuses startup/store
 creation whenever `LEM_AUTH_DB` is enabled rather than accepting unprotected
