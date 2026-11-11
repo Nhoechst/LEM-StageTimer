@@ -30,9 +30,8 @@ async function serve(t, env) {
   return base;
 }
 
-function client(base, id = 'a'.repeat(32)) {
-  const cookies = new Map();
-  return async (method = 'GET', payload, extra = {}) => {
+function client(base, id = 'a'.repeat(32), cookies = new Map()) {
+  const request = async (method = 'GET', payload, extra = {}) => {
     const response = await fetch(`${base}/api.php`, {
       method, headers: { Origin: base, 'Content-Type': 'application/json', 'X-Operator-ID': id,
         Cookie: [...cookies].map(([key, value]) => `${key}=${value}`).join('; '), ...extra },
@@ -40,10 +39,13 @@ function client(base, id = 'a'.repeat(32)) {
     });
     for (const cookie of response.headers.getSetCookie()) {
       const [key, value] = cookie.split(';')[0].split('=');
-      cookies.set(key, value);
+      if (value === 'deleted' || /max-age=0/i.test(cookie)) cookies.delete(key);
+      else cookies.set(key, value);
     }
     return { status: response.status, body: await response.json(), headers: response.headers };
   };
+  request.cookies = cookies;
+  return request;
 }
 
 function directory(t) {
@@ -121,6 +123,7 @@ test('PHP shared login gates all writes without a PIN, then requires account and
       }
     }
     assert.equal(expired, 1);
+    request.cookies.delete('lem_sso'); // the shared log-in cookie runs out at the same time
     const expiredAccount = (await request()).body.account;
     assert.equal(expiredAccount.user, null);
     assert.equal((await request('PUT', { ...state, revision: 2 })).status, 401);
@@ -146,6 +149,43 @@ test('PHP shared login gates all writes without a PIN, then requires account and
     assert.equal(persisted.body.revision, 2);
     assert.equal(persisted.body.auth.configured, true);
     assert.equal(persisted.body.auth.authorized, false);
+  });
+
+test('PHP shared login follows log-ins and log-outs of the other LEM apps on the same address (single sign-on)',
+  { skip: !hasPHP }, async t => {
+    const dir = directory(t);
+    const authFile = path.join(dir, 'users.db');
+    seedAccounts(authFile);
+    // Two instances stand in for two LEM apps on different ports of one address: the browser
+    // sends the same lem_sso cookie to both.
+    const browser = new Map();
+    const here = client(await serve(t, { LEM_DATA_DIR: path.join(dir, 'here'), LEM_AUTH_DB: authFile }), 'a'.repeat(32), browser);
+    const other = client(await serve(t, { LEM_DATA_DIR: path.join(dir, 'other'), LEM_AUTH_DB: authFile }), 'a'.repeat(32), new Map());
+    const login = { action: 'login', username: 'OPERATOR', password: 'test-only-password' };
+    assert.equal((await here()).body.account.user, null);
+    assert.equal((await here('POST', { ...login, csrf: (await here()).body.account.csrf })).status, 200);
+    const shared = browser.get('lem_sso');
+    assert.match(shared ?? '', /^1\./);
+    other.cookies.set('lem_sso', shared);
+    const followed = await other();
+    assert.equal(followed.body.account.user?.username, 'operator');
+    assert.equal(followed.body.auth.authorized, true); // no installation PIN set here yet
+    assert.equal((await other('PUT', state)).status, 200);
+    other.cookies.set('lem_sso', shared.slice(0, -1) + (shared.endsWith('0') ? '1' : '0'));
+    assert.equal((await other()).body.account.user, null);
+    other.cookies.set('lem_sso', shared);
+    assert.equal((await other()).body.account.user?.username, 'operator');
+    const out = await other('POST', { action: 'logout', csrf: (await other()).body.account.csrf });
+    assert.equal(out.status, 200);
+    assert.equal(other.cookies.has('lem_sso'), false);
+    assert.equal((await here()).body.account.user, null); // logged out of every app
+    assert.equal((await here('PUT', state)).status, 401);
+    browser.delete('lem_sso');
+    const temporary = new DatabaseSync(authFile);
+    t.after(() => temporary.close());
+    temporary.prepare('UPDATE users SET must_change_password = 1').run();
+    assert.equal((await here('POST', { ...login, csrf: (await here()).body.account.csrf })).status, 403);
+    assert.equal(browser.has('lem_sso'), false);
   });
 
 test('shared mode defers legacy imports/backups until account login and preserves the imported PIN',

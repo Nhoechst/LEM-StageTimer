@@ -12,6 +12,7 @@ export default defineConfig(({ mode }) => ({
     generateBundle() {
       this.emitFile({ type: 'asset', fileName: 'api.php', source: readFileSync(new URL('./php/api.php', import.meta.url), 'utf8') });
       this.emitFile({ type: 'asset', fileName: 'SharedAccounts.php', source: readFileSync(new URL('./php/SharedAccounts.php', import.meta.url), 'utf8') });
+      this.emitFile({ type: 'asset', fileName: 'SharedLogin.php', source: readFileSync(new URL('./php/SharedLogin.php', import.meta.url), 'utf8') });
     },
   }] : [],
   server: {
